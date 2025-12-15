@@ -1,0 +1,440 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, set_ev_cls
+from ryu.lib.packet import packet, ethernet, arp, ipv4, udp, tcp
+from ryu.ofproto import ether, ofproto_v1_3
+from ryu.topology import event
+import threading
+from collections import defaultdict
+from dataclasses import dataclass
+import networkx as nx
+import time
+
+# ================= CONFIG =================
+REFERENCE_BW = 10000000
+DEFAULT_BW = 10000000  # used only as fallback in bw dict
+MAX_PATHS = 2
+EPS = 1e-6
+
+IPPROTO_ICMP = 1
+IPPROTO_TCP  = 6
+IPPROTO_UDP  = 17
+
+@dataclass
+class Paths:
+    path: list
+    cost: float
+
+
+class ControllerDijkstra(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # topo & stats
+        self.neigh = defaultdict(dict)   # neigh[u][v] = port on u toward v
+        self.bw = defaultdict(lambda: defaultdict(lambda: DEFAULT_BW))  # bw[dpid][port] = Mbps
+        self.prev_bytes = defaultdict(lambda: defaultdict(lambda: 0))
+
+        # host learning
+        self.hosts = {}      # hosts[mac] = (dpid, port)
+        self.switches = []   # list of dpids
+        self.arp_table = {}  # ip -> mac
+
+        # path caches
+        self.path_table = {}
+        self.path_with_ports_table = {}
+        self.paths_table = {}
+        self.datapath_list = {}
+        self.path_calculation_keeper = []
+
+        # Dijkstra graph
+        self.G = nx.DiGraph()
+
+        # optional stats for display-only latency
+        self.flow_stats = {}  # (dpid,out_port)->(duration_sec, byte_count)
+        self.link_latency = defaultdict(lambda: defaultdict(lambda: 0.0))  # u->v ms
+
+        # periodic flow stats
+        threading.Timer(5.0, self._monitor_flow_stats).start()
+
+    # ================= BANDWIDTH =================
+    def get_bandwidth(self, u, v):
+        port = self.neigh[u].get(v)
+        if port is None:
+            return 0.0
+        return float(self.bw[u].get(port, DEFAULT_BW))
+
+    # ================= GRAPH BUILD =================
+    def update_graph(self):
+        self.G.clear()
+
+        for u in self.neigh:
+            for v in self.neigh[u]:
+                bw = self.get_bandwidth(u, v)
+                cost = 1.0 / (bw + EPS)
+
+                out_port = self.neigh[u][v]
+                duration, bytes_count = self.flow_stats.get((u, out_port), (0, 1))
+                if bytes_count == 0:
+                    bytes_count = 1
+
+                est_switch_lat = 100.0 * (float(duration) / float(bytes_count))  # heuristic (display-only)
+                lldp_lat = float(self.link_latency[u].get(v, 0.0))
+                total_lat = est_switch_lat + lldp_lat
+
+                self.G.add_edge(
+                    u, v,
+                    weight=cost,
+                    estimated_bandwidth_mbps=bw,
+                    estimated_latency_ms=total_lat
+                )
+
+                # LINK THROUGHPUT LOG
+                self.logger.info(
+                    "LINK %s->%s | BW=%.3f Mbps | Cost=%.6f | Lat(display)=%.3f ms",
+                    u, v, bw, cost, total_lat
+                )
+
+    # ================= DIJKSTRA =================
+    def find_best_path(self, src, dst):
+        self.update_graph()
+        try:
+            path = nx.dijkstra_path(self.G, src, dst, weight='weight')
+
+            per_hop_cost = [self.G[u][v]['weight'] for u, v in zip(path[:-1], path[1:])]
+            per_hop_bw = [self.G[u][v].get('estimated_bandwidth_mbps', 0.0) for u, v in zip(path[:-1], path[1:])]
+            per_hop_lat = [self.G[u][v].get('estimated_latency_ms', 0.0) for u, v in zip(path[:-1], path[1:])]
+
+            total_cost = sum(per_hop_cost)
+            path_throughput = min(per_hop_bw) if per_hop_bw else 0.0
+            total_latency = sum(per_hop_lat)
+
+            self.logger.info("==== DIJKSTRA RESULT ====")
+            self.logger.info("Path: %s", path)
+            self.logger.info("Per-hop throughput (Mbps): %s", ["%.3f" % x for x in per_hop_bw])
+            self.logger.info("PATH THROUGHPUT (bottleneck): %.3f Mbps", path_throughput)
+            self.logger.info("Total cost: %.6f", total_cost)
+            self.logger.info("Total latency (display-only): %.3f ms", total_latency)
+            self.logger.info("=========================")
+
+            return [Paths(path, total_cost)]
+        except nx.NetworkXNoPath:
+            self.logger.info("No path from %s to %s", src, dst)
+            return []
+        except Exception as e:
+            self.logger.info("find_best_path error: %s", str(e))
+            return []
+
+    # ================= PORT MAPPING =================
+    def add_ports_to_paths(self, paths, first_port, last_port):
+        if not paths:
+            return []
+        bar = {}
+        in_port = first_port
+        for s1, s2 in zip(paths[0].path[:-1], paths[0].path[1:]):
+            out_port = self.neigh[s1][s2]
+            bar[s1] = (in_port, out_port)
+            in_port = self.neigh[s2][s1]
+        bar[paths[0].path[-1]] = (in_port, last_port)
+        return [bar]
+
+    # ================= FLOW INSTALL =================
+    def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst, pkt_type, pkt):
+        key = (src, first_port, dst, last_port)
+
+        if key not in self.path_calculation_keeper:
+            self.path_calculation_keeper.append(key)
+            self.topology_discover(src, first_port, dst, last_port)
+            self.topology_discover(dst, last_port, src, first_port)
+
+        if key not in self.path_table or not self.path_table[key]:
+            self.logger.info("[install_paths] no path yet for %s", str(key))
+            return None
+
+        path = self.path_table[key][0].path
+        per_hop_bw = [self.G[u][v].get('estimated_bandwidth_mbps', 0.0) for u, v in zip(path[:-1], path[1:])]
+        path_throughput = min(per_hop_bw) if per_hop_bw else 0.0
+
+        self.logger.info(
+            "[INSTALL PATH] %s -> %s | Path=%s | Throughput=%.3f Mbps",
+            src, dst, path, path_throughput
+        )
+
+        for node in path:
+            if node not in self.datapath_list:
+                continue
+            dp = self.datapath_list[node]
+            parser = dp.ofproto_parser
+            ofp = dp.ofproto
+
+            in_port, out_port = self.path_with_ports_table[key][0][node]
+            actions = [parser.OFPActionOutput(out_port)]
+
+            match = None
+            if pkt_type == 'UDP':
+                nw = pkt.get_protocol(ipv4.ipv4)
+                l4 = pkt.get_protocol(udp.udp)
+                if nw and l4:
+                    match = parser.OFPMatch(
+                        in_port=in_port, eth_type=ether.ETH_TYPE_IP,
+                        ipv4_src=ip_src, ipv4_dst=ip_dst,
+                        ip_proto=IPPROTO_UDP,
+                        udp_src=l4.src_port, udp_dst=l4.dst_port
+                    )
+
+            elif pkt_type == 'TCP':
+                nw = pkt.get_protocol(ipv4.ipv4)
+                l4 = pkt.get_protocol(tcp.tcp)
+                if nw and l4:
+                    match = parser.OFPMatch(
+                        in_port=in_port, eth_type=ether.ETH_TYPE_IP,
+                        ipv4_src=ip_src, ipv4_dst=ip_dst,
+                        ip_proto=IPPROTO_TCP,
+                        tcp_src=l4.src_port, tcp_dst=l4.dst_port
+                    )
+
+            elif pkt_type == 'ICMP':
+                match = parser.OFPMatch(
+                    in_port=in_port, eth_type=ether.ETH_TYPE_IP,
+                    ipv4_src=ip_src, ipv4_dst=ip_dst,
+                    ip_proto=IPPROTO_ICMP
+                )
+
+            elif pkt_type == 'ARP':
+                match = parser.OFPMatch(
+                    in_port=in_port, eth_type=ether.ETH_TYPE_ARP,
+                    arp_spa=ip_src, arp_tpa=ip_dst
+                )
+
+            if match is not None:
+                self.add_flow(dp, 32768, match, actions, 10)
+
+        # return out_port at first switch for PacketOut usage
+        return self.path_with_ports_table[key][0][src][1]
+
+    def add_flow(self, datapath, priority, match, actions, idle_timeout, buffer_id=None):
+        parser = datapath.ofproto_parser
+        ofp = datapath.ofproto
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+
+        if buffer_id is None:
+            mod = parser.OFPFlowMod(
+                datapath=datapath, priority=priority,
+                match=match, idle_timeout=idle_timeout,
+                instructions=inst
+            )
+        else:
+            mod = parser.OFPFlowMod(
+                datapath=datapath, buffer_id=buffer_id,
+                priority=priority, match=match,
+                idle_timeout=idle_timeout, instructions=inst
+            )
+
+        datapath.send_msg(mod)
+
+    # ================= TOPOLOGY DISCOVER =================
+    def topology_discover(self, src, first_port, dst, last_port):
+        threading.Timer(1.0, self.topology_discover, args=(src, first_port, dst, last_port)).start()
+        paths = self.find_best_path(src, dst)
+        ports = self.add_ports_to_paths(paths, first_port, last_port)
+        self.path_table[(src, first_port, dst, last_port)] = paths
+        self.path_with_ports_table[(src, first_port, dst, last_port)] = ports
+        self.paths_table[(src, first_port, dst, last_port)] = paths
+
+    # ================= PACKET IN (FIX 100% DROP) =================
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        parser = datapath.ofproto_parser
+        ofp = datapath.ofproto
+        in_port = msg.match['in_port']
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+
+        # ignore LLDP
+        if eth.ethertype == ether.ETH_TYPE_LLDP:
+            return
+
+        src_mac = eth.src
+        dst_mac = eth.dst
+        dpid = datapath.id
+
+        # learn host location
+        if src_mac not in self.hosts:
+            self.hosts[src_mac] = (dpid, in_port)
+
+        out_port = ofp.OFPP_FLOOD
+
+        arp_pkt = pkt.get_protocol(arp.arp)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+
+        # ---------- ARP ----------
+        if eth.ethertype == ether.ETH_TYPE_ARP and arp_pkt:
+            src_ip = arp_pkt.src_ip
+            dst_ip = arp_pkt.dst_ip
+            self.arp_table[src_ip] = src_mac
+
+            h1 = self.hosts.get(src_mac)
+            h2 = self.hosts.get(dst_mac)
+
+            # if we know dst host by MAC, install ARP path; else flood (normal ARP discovery)
+            if h1 and h2:
+                out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip, 'ARP', pkt) or out_port
+                # also reverse
+                self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip, 'ARP', pkt)
+
+        # ---------- IPv4 ----------
+        elif eth.ethertype == ether.ETH_TYPE_IP and ip_pkt:
+            src_ip = ip_pkt.src
+            dst_ip = ip_pkt.dst
+            self.arp_table[src_ip] = src_mac
+
+            h1 = self.hosts.get(src_mac)
+            h2 = self.hosts.get(dst_mac)
+
+            if h1 and h2:
+                if ip_pkt.proto == IPPROTO_UDP:
+                    out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip, 'UDP', pkt) or out_port
+                    self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip, 'UDP', pkt)
+
+                elif ip_pkt.proto == IPPROTO_TCP:
+                    out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip, 'TCP', pkt) or out_port
+                    self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip, 'TCP', pkt)
+
+                elif ip_pkt.proto == IPPROTO_ICMP:
+                    out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip, 'ICMP', pkt) or out_port
+                    self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip, 'ICMP', pkt)
+
+        # ---------- PACKET OUT (critical) ----------
+        actions = [parser.OFPActionOutput(out_port)]
+        data = None
+        if msg.buffer_id == ofp.OFP_NO_BUFFER:
+            data = msg.data
+
+        out = parser.OFPPacketOut(
+            datapath=datapath, buffer_id=msg.buffer_id,
+            in_port=in_port, actions=actions, data=data
+        )
+        datapath.send_msg(out)
+
+    # ================= SWITCH FEATURES =================
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def _switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        parser = datapath.ofproto_parser
+        ofp = datapath.ofproto
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
+        self.add_flow(datapath, 0, match, actions, 10)
+
+    # ================= SWITCH / LINK EVENTS =================
+    @set_ev_cls(event.EventSwitchEnter)
+    def switch_enter_handler(self, ev):
+        dp = ev.switch.dp
+        dpid = dp.id
+        parser = dp.ofproto_parser
+
+        self.logger.info("Switch plugged in: DPID %s", dpid)
+        if dpid not in self.switches:
+            self.switches.append(dpid)
+            self.datapath_list[dpid] = dp
+            self.run_check(parser, dp)
+
+    @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
+    def switch_leave_handler(self, ev):
+        dpid = ev.switch.dp.id
+        if dpid in self.switches:
+            self.switches.remove(dpid)
+        if dpid in self.datapath_list:
+            del self.datapath_list[dpid]
+        if dpid in self.neigh:
+            del self.neigh[dpid]
+
+    @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
+    def link_add_handler(self, ev):
+        src = ev.link.src.dpid
+        dst = ev.link.dst.dpid
+        self.neigh[src][dst] = ev.link.src.port_no
+        self.neigh[dst][src] = ev.link.dst.port_no
+
+        # optional: latency from topology provider
+        lldp_latency = getattr(ev.link, "latency", None)
+        if lldp_latency is not None:
+            try:
+                val = float(lldp_latency)
+                self.link_latency[src][dst] = val
+                self.link_latency[dst][src] = val
+            except Exception:
+                self.link_latency[src][dst] = 0.0
+                self.link_latency[dst][src] = 0.0
+
+        bw_fwd = self.get_bandwidth(src, dst)
+        bw_rev = self.get_bandwidth(dst, src)
+        self.logger.info(
+            "Link established: %s:%s <-> %s:%s | bw_fwd=%.3fMbps bw_rev=%.3fMbps",
+            src, ev.link.src.port_no, dst, ev.link.dst.port_no, bw_fwd, bw_rev
+        )
+
+    @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
+    def link_delete_handler(self, ev):
+        try:
+            del self.neigh[ev.link.src.dpid][ev.link.dst.dpid]
+            del self.neigh[ev.link.dst.dpid][ev.link.src.dpid]
+            self.logger.info("Link removed: %s <-> %s", ev.link.src.dpid, ev.link.dst.dpid)
+        except KeyError:
+            pass
+
+    # ================= PORT STATS =================
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        for p in ev.msg.body:
+            prev = self.prev_bytes[dpid][p.port_no]
+            delta = p.tx_bytes - prev
+            bw_mbps = float(delta) * 8.0 / 1_000_000.0   # Mbps per 1 second
+            self.bw[dpid][p.port_no] = bw_mbps
+            self.prev_bytes[dpid][p.port_no] = p.tx_bytes
+
+    def run_check(self, parser, dp):
+        threading.Timer(1.0, self.run_check, args=(parser, dp)).start()
+        req = parser.OFPPortStatsRequest(dp)
+        dp.send_msg(req)
+
+    # ================= FLOW STATS =================
+    def request_flow_stats(self, dp):
+        dp.send_msg(dp.ofproto_parser.OFPFlowStatsRequest(dp))
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        dpid = ev.msg.datapath.id
+        for stat in ev.msg.body:
+            try:
+                out_port = None
+                for inst in getattr(stat, 'instructions', []):
+                    for act in getattr(inst, 'actions', []):
+                        if hasattr(act, 'port'):
+                            out_port = act.port
+                            break
+                    if out_port is not None:
+                        break
+                if out_port is not None:
+                    self.flow_stats[(dpid, out_port)] = (
+                        int(getattr(stat, 'duration_sec', 0)),
+                        max(int(getattr(stat, 'byte_count', 0)), 1)
+                    )
+            except Exception:
+                pass
+
+    def _monitor_flow_stats(self):
+        threading.Timer(5.0, self._monitor_flow_stats).start()
+        for dp in self.datapath_list.values():
+            self.request_flow_stats(dp)
+        # do not block reactor thread heavily; sleep is minimal
+        time.sleep(0.05)
